@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/1091918627.svg)](https://doi.org/10.5281/zenodo.17554028)
+
 # TACLion Skyn Sensor Data Processing Algorithm
 
 This repository contains an adapted version of the code used to process data collected with the Skyn transdermal alcohol concentration sensor, described in this manuscript:
