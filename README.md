@@ -9,7 +9,7 @@ This repository contains an adapted version of the code used to process data col
 
 The original version of this algorithm included a weekend-level specification due to the study design. The following code has been adapted to process continuously collected data.
 
-If you are interested in weekend-level processing, please contact [veronica-richards\@ou.edu](mailto:veronica-richards@ou.edu){.email}
+If you are interested in weekend-level processing, please contact [veronica-richards\@ou.edu](mailto:veronica-richards@ou.edu)
 
 ------------------------------------------------------------------------
 
@@ -38,5 +38,5 @@ Final data output containing TAC features for all days with Skyn data
 ## Contact
 
 For questions, please contact:\
-📧 Veronica L. Richards — [veronica-richards\@ou.edu](mailto:veronica-richards@ou.edu){.email}\
+📧 Veronica L. Richards — [veronica-richards\@ou.edu](mailto:veronica-richards@ou.edu)\
 [Southern Plains Alcohol Research Lab on Consequences in Lived Environments](https://www.sparclelab.com/)\
