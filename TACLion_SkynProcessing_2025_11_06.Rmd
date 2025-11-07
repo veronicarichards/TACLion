@@ -1,0 +1,1632 @@
+---
+title: "TACLion Skyn Data Processing Algorithm"
+author: "Veronica Richards & Michael Russell"
+date: "November 7, 2025"
+output:
+  html_document:
+    df_print: kable
+    mathjax: default
+    number_sections: no
+    theme: default
+    highlight: tango
+    toc: yes
+    toc_float: true
+editor_options:
+  chunk_output_type: console
+---
+
+#Read in data
+
+```{r, include=F}
+
+# Set working directory
+setwd("~/Library/CloudStorage/OneDrive-UniversityofOklahoma/Methods/TACLionSkynProcessingCode") #Update to your own
+
+# Read in Skyn data and ID file (if applicable)
+testdata = read.csv("TACLion_TestData_2025_11_06.csv")
+ids = read.csv("IDs.csv")
+
+```
+
+
+# Load packages
+
+```{r}
+
+# install.packages(c("summarytools","psych","plyr","dplyr","hablar","ggplot2",
+#                    "lubridate","runner","collapse","Hmisc","pacman","zoo","ggforce"))
+
+#Load packages (install if needed using code above)
+pacman::p_load(summarytools, psych, plyr, dplyr, hablar, ggplot2, lubridate)
+
+```
+
+
+# Merge Skyn data with IDs (if applicable)
+```{r}
+
+skyn = merge(ids, testdata, by = c("email","device.id"), all = T)
+
+```
+
+
+# Initial look 
+
+```{r}
+
+names(skyn) # variable names
+
+head(skyn)
+
+```
+
+
+# Time and date variables
+
+```{r}
+
+# Convert to datetime format
+skyn$device.timestamp <- ymd_hms(skyn$device.timestamp)
+
+# Extract Date and Time
+skyn$date <- as.Date(skyn$device.timestamp)
+skyn$time <- format(skyn$device.timestamp, "%H:%M:%S")
+
+# Calculate numeric date and time 
+skyn$daten = as.numeric(as.Date(skyn$device.timestamp))
+
+skyn = as.data.frame(
+  skyn %>%
+    mutate(timen = strptime(time, format = "%H:%M:%S"),
+           hours = hour(timen),
+           minutes = minute(timen),
+           seconds = second(timen),
+           dayofweek = weekdays(as.Date(date)))
+)
+
+# Check frequencies
+with(skyn, table(date, dayofweek))
+freq(skyn$date) 
+
+```
+
+
+# Total number of observations
+
+```{r}
+
+sum(!is.na(skyn$id)) #no missing -- this should only be missing if you have a participant id who had no skyn data
+#28,493 observations
+
+```
+
+# Applying the algorithm for marking "worn" versus "not worn"
+
+## First pass: Is the temp over 28 C? 
+
+This is 82.4 degrees F. 
+
+```{r}
+
+sum(is.na(skyn$temperature..C.)) #no missing -- this should only be missing if you have a participant id who had no skyn data
+
+skyn1 = as.data.frame(
+  skyn %>%
+    mutate(check1 = ifelse(temperature..C. > 28, 1, 
+                           ifelse(temperature..C. <= 28, 0, NA)))
+)
+
+freq(skyn1$check1) # 26.44% are below 28 C
+
+```
+
+The 86.8% over 28 C will be counted as being "worn".
+
+## Second pass: Is the temperature amount over 5 degrees greater than the participant's minimum?
+
+The first step is to find the minimum temperature for each participant. 
+
+```{r}
+
+skyn1 = as.data.frame(
+  skyn1 %>% 
+    group_by(id) %>%
+    mutate(min_temp_C.i = min_(temperature..C.))
+)
+
+# make a first and last by id for filtering and ordering 
+
+skyn1 = as.data.frame(
+  skyn1 %>%
+    arrange(id, daten, hours, minutes, seconds) %>%
+    group_by(id) %>%
+    mutate(firstbyid = ifelse(row_number() == 1, 1, 0),
+           lastbyid = ifelse(row_number() == max(row_number()), 1, 0))
+)
+
+# see the minimum temp distribution in celsius
+
+minCtemps = skyn1[which(skyn1$firstbyid == 1), "min_temp_C.i"]
+
+hist(minCtemps) 
+
+# in fahrenheit 
+
+minFtemps = (minCtemps*(9/5)) + 32
+
+hist(minFtemps)
+Hmisc::describe(minFtemps)
+
+```
+
+The second step is to determine if the data point is more than 5 degrees greater than the participant's minimum (in C).
+
+```{r}
+
+skyn1 = as.data.frame(
+  skyn1 %>%
+    mutate(check2 = ifelse(temperature..C. - min_temp_C.i > 5, 1, 
+                           ifelse(temperature..C. - min_temp_C.i <= 5, 0, NA)))
+)
+
+# what number of observations are captured here? 
+freq(skyn1[which(skyn1$check1 == 0), "check2"]) 
+with(skyn1, ctable(check2, check1, prop = "t")) 
+
+# with(skyn1, {
+#   tbl <- table(factor(check2), factor(check1))  # Contingency table
+#   prop_tbl <- prop.table(tbl)  # Proportions
+#   print(prop_tbl)
+# })
+
+# Here we capture an additional 5% of total observations as "worn", 78.6% of observations considered worn so far
+```
+
+## Third pass: Is the temp reading more than the temperature "floor" for that user *and* does the motion sensor register above 0.01 Gs? 
+
+The temperature "floor" is more than 3 degrees over the minimum temp for that user. If this is not true, the device reading is counted as "not worn". 
+If this is true, then the device motion sensor is checked. If this is above 0.01 Gs, then it is considered "worn", if it is not true, "not worn".
+
+```{r}
+
+# calculate the floor
+skyn1$temp_C_floor.i = with(skyn1, min_temp_C.i + 3)
+
+# make a motion threshold indicator 
+sum(is.na(skyn1$motion..g.)) 
+
+skyn1$motion_g_thr = with(skyn1, ifelse(motion..g. > 0.01, 1, 
+                                        ifelse(motion..g. <= 0.01, 0, NA)))
+
+# below threshold check
+belowOReq.mt = skyn1[which(skyn1$motion_g_thr == 0), "motion..g."]
+above.mt = skyn1[which(skyn1$motion_g_thr == 1), "motion..g."]
+
+# Hmisc::describe(belowOReq.mt)
+# Hmisc::describe(above.mt)
+```
+
+```{r}
+
+## COMBINE INTO FINAL CHECK ## 
+
+skyn1 = as.data.frame(
+  skyn1 %>%
+    mutate(check3 = ifelse(temperature..C. > temp_C_floor.i & motion_g_thr == 1, 1, 
+                           ifelse((temperature..C. <= temp_C_floor.i) 
+                                  | motion_g_thr == 0, 0, NA)))
+)
+
+# what number of observations are captured here? 
+freq(skyn1[which(skyn1$check1 == 0 & skyn1$check2 == 0), "check3"]) # this captures an additional 0.4% of the observations not captured by previous thresholds. 
+
+with(skyn1, 
+     ctable(check3, check2, prop = "t")) # and an additional 0.09% of total observations  
+
+```
+
+# Applying the final "worn" algorithm 
+
+```{r}
+
+skyn1 <- as.data.frame(
+  skyn1 %>%
+    rowwise() %>%
+    mutate(worn.sum = sum_(c(check1, check2, check3))) %>%
+    ungroup() %>%
+    mutate(worn = ifelse(worn.sum > 0, 1, 
+                         ifelse(worn.sum == 0, 0, NA)))
+)
+
+# checks -- does this equal the sum of checks? 
+
+(check1total = sum(skyn1$check1, na.rm = TRUE)) #20,960
+(check2total = sum(skyn1[which(skyn1$check1 == 0), "check2"])) #1,431
+(check3total = sum(skyn1[which(skyn1$check1 == 0 & skyn1$check2 == 0), "check3"])) #27
+
+sum(skyn1$worn, na.rm = TRUE) == sum(c(check1total, check2total, check3total), na.rm = TRUE)  # equal 
+
+```
+
+# What is the overall worn percentage?
+
+78.7% 
+
+```{r}
+
+freq(skyn1$worn)
+
+```
+
+# Shift the days to 'social' days
+
+```{r}
+
+## shifting to a 9AM-9AM day
+
+sum(is.na(skyn1$daten)) 
+sum(is.na(skyn1$hours))
+
+skyn1 = as.data.frame(
+  skyn1 %>%
+    mutate(sdaten = ifelse(hours < 9, daten - 1, 
+                           ifelse(hours >= 9, daten, NA)))
+)
+
+head(skyn1[which(skyn1$hours >= 9),c("id","daten","hours", "minutes", "sdaten")], 20)
+head(skyn1[which(skyn1$hours < 9),c("id","daten","hours", "minutes", "sdaten")], 20)
+
+# create a continuous time marker within days 
+
+## 
+
+skyn1 = as.data.frame(
+  skyn1 %>%
+    mutate(shours = ifelse(hours >= 9, hours - 9, 
+                           ifelse(hours < 9, hours + 15, NA)))
+)
+
+# with(skyn1, ctable(shours, hours))
+
+## Calculate minutes and seconds as fractions of hours 
+
+skyn1 = as.data.frame(
+  skyn1 %>%
+    mutate(minutes_hours = minutes / 60,
+           seconds_hours = (seconds / 3600)) %>%
+    rowwise() %>%
+    mutate(sconthours = sum_(c(shours, minutes_hours, seconds_hours)))
+)
+
+head(skyn1[,c("id","daten","hours","sdaten","shours","minutes","seconds","sconthours")])
+
+## Make continuous hours since start of the study 
+
+skyn1 = as.data.frame(
+  skyn1 %>%
+    group_by(id) %>%
+    mutate(
+      sdatencountc1 = sdaten - min_(sdaten),
+      sdatencountc1_hours = sdatencountc1 * 24
+    ) %>%
+    mutate(
+      sdatencount.wknd.c1 = sdaten - min_(sdaten)
+    ) %>%
+    rowwise() %>%
+    mutate(
+      sconthours_study = sum_(c(sdatencountc1_hours, shours, minutes_hours, seconds_hours))
+    ) %>%
+    select(-c(sdatencountc1_hours))
+)
+
+# View(skyn1[which(skyn1$id == min_(skyn1$id)),
+#            c("id","daten","hours","sdaten","shours","minutes","seconds",
+#              "sconthours","sconthours_study", "firstbyid","lastbyid","dayofweek")])
+
+### Identify the day of week 
+
+freq(skyn1$sdatencountc1)
+with(skyn1, table(factor(dayofweek), factor(sdatencountc1)))
+
+# make a dayofweek based on sdaten 
+
+skyn1$dayofweek_sdaten = weekdays(zoo::as.Date(skyn1$sdaten))
+
+with(skyn1, table(dayofweek_sdaten, dayofweek))
+
+```
+
+# Filter out "non-worn"
+
+```{r}
+
+skyn2 <- filter(skyn1, worn == 1)
+
+```
+
+Redo first and last by id (because we may have dropped some firsts and lasts) and make firstbywknd and lastbywknd (first and last by weekend)
+
+```{r}
+
+skyn2 = select(skyn2, -c(firstbyid, lastbyid))
+
+skyn2 = as.data.frame(
+  skyn2 %>%
+    arrange(id, daten, hours, minutes, seconds) %>%
+    group_by(id) %>%
+    mutate(firstbyid = ifelse(row_number() == 1, 1, 0),
+           lastbyid = ifelse(row_number() == max(row_number()), 1, 0)) 
+)
+
+```
+
+## Calculate compliance for study
+```{r}
+
+ skyn3 <- skyn2 %>%
+  group_by(id) %>% 
+  summarise(sumobs = sum_(worn))
+  
+describe(skyn3$sumobs) #mean observations/person = 11,209 
+
+```
+
+## Plot TAC Curves per person/day 
+
+# Next Steps
+
+## 1) Identifying Episodes
+
+Start and end of episodes -- two 0's then 5+. So an episode could look like 00555500 or 005505500 or 005050500.
+
+```{r}
+
+sum(is.na(skyn2$tac..ug.L.)) # no missing
+
+# sort data and code TAC according to threshold of 5, recode 0 and below to 0
+
+# make a time variable in seconds 
+
+skyn2$scont.seconds_study = with(skyn2, sconthours_study*3600)
+
+## smooth TAC using a 30-min time window
+
+### I am using a centered moving average over 30 minutes. By lagging half-way through the interval, I am centering the moving average and using data from 15 mins prior to 15 mins after to smooth the series. The runner function appears to use all available data so no missing are generated.  
+
+skyn2 = as.data.frame(
+   skyn2 %>%
+     arrange(id, sconthours_study) %>%
+     group_by(id) %>%
+     mutate(tac..ug.L.smooth = runner::mean_run(tac..ug.L., k = 1800, lag = -900, 
+                                                  idx =  scont.seconds_study))
+)
+
+
+# This is how smoothing works. When it works well, it creates a variable that has the same mean, less variance, and maintains a high correlation with the original. We have accomplished that here. 
+
+cov(skyn2[,c("tac..ug.L.","tac..ug.L.smooth")], use = "pairwise.complete.obs")
+cor(skyn2[,c("tac..ug.L.","tac..ug.L.smooth")], use = "pairwise.complete.obs") # r ~ 0.94
+describe(skyn2[,c("tac..ug.L.","tac..ug.L.smooth")]) # mean is the same (in this example, off by .01), smoothed variable has a lower SD. 
+mean_(skyn2$tac..ug.L.smooth - skyn2$tac..ug.L.)  
+
+head(skyn2[,c("id","daten")])
+
+head(skyn2[which(skyn2$firstbyid == 1), c("id","daten")])
+
+# ggplot(skyn2[which(skyn2$id == 3176 & skyn2$daten == 20384),]) +
+#   geom_point(aes(y = tac..ug.L.smooth, x = sconthours_study), size = 1, color = "blue") +
+#   geom_line(aes(y = tac..ug.L.smooth, x = sconthours_study), linewidth = 1, color = "blue") +
+#   geom_point(aes(y = tac..ug.L., x = sconthours_study), size = 1) +
+#   geom_line(aes(y = tac..ug.L., x = sconthours_study), linewidth = 1)
+
+skyn2 = as.data.frame(
+  skyn2 %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(tac.pos = ifelse(tac..ug.L.smooth > 5, 1, 0),
+           tac = ifelse(tac..ug.L.smooth <= 0, 0, tac..ug.L.smooth))
+)
+
+with(skyn2, describeBy(tac, group = tac..ug.L.smooth <= 0))
+
+freq(skyn2$tac.pos) # 22.5% positive
+
+```
+
+```{r}
+
+## FIND PATTERNS ##
+
+skyn2 = as.data.frame(
+  skyn2 %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(tac.pos.lead1 = lead(tac.pos, default = -99),
+           tac.pos.lead2 = lead(tac.pos, n = 2, default = -99),
+           tac.pos.lag1 = lag(tac.pos, default = -99),
+           tac.pos.lag2 = lag(tac.pos, n = 2, default = -99)
+           ))
+
+```
+
+
+### Episode Coding Rules 
+
+#### START RULES
+
+IF the observation is alcohol-positive (tac.pos == 1) and both of the preceding are not (tac.pos.lag2 == 0 & tac.pos.lag1 == 0) 
+ THEN the alcohol-positive observation is considered the *start* of a new episode/event (e.g., 005).
+
+#### END RULES
+
+IF the observation is alcohol-positive (tac.pos == 1) and both of the following are not (tac.pos.lead1 == 0 & tac.pos.lead2 == 0)
+ THEN the alcohol-positive observation is the possible *ending* of an episode/event.
+ 
+
+```{r}
+
+head(skyn2)
+
+# CODING STARTS #
+
+skyn2 <- skyn2 %>%
+  mutate(
+    firstpos = ifelse(tac.pos == 1 & tac.pos.lag2 == 0 & tac.pos.lag1 == 0, 1, 0),
+    lastpos  = ifelse(tac.pos == 1 & tac.pos.lead1 == 0 & tac.pos.lead2 == 0, 1, 0)
+  )
+
+# do we have the same number of starts and ends? YES
+
+freq(skyn2[,c("firstpos","lastpos")]) #7 each
+
+with(skyn2, table(firstpos, lastpos))
+
+# identify types of starts and ends 
+
+skyn2 = as.data.frame(
+  skyn2 %>%
+    mutate(start.type1 = ifelse(tac.pos == 1 & (tac.pos.lag2 == 0 & tac.pos.lag1 == 0), 1, 0),
+           end.type1 = ifelse(tac.pos == 1 & (tac.pos.lead1 == 0 & tac.pos.lead2 == 0), 1, 0))
+          )
+
+
+sapply(skyn2[,c("start.type1", "end.type1")], table)
+
+```
+
+
+
+```{r}
+
+# INCLUDE TRAILING AND LEADING ZEROS WHERE APPROPRIATE # 
+
+skyn2 = as.data.frame(
+  skyn2 %>% 
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(start.type1.lead1 = lead(start.type1, default = -99),
+           end.type1.lag1 = lag(end.type1, default = -99),
+           
+           sconthours_study_lagdif1 = sconthours_study - lag(sconthours_study),
+           scounthours_study_leaddif1 = lead(sconthours_study) - sconthours_study,
+           
+           longlagdiff = ifelse(sconthours_study_lagdif1 > .5, 1, 
+                                ifelse(sconthours_study_lagdif1 <= .5, 0, NA)),
+           longleaddiff = ifelse(scounthours_study_leaddif1 > .5, 1, 
+                                 ifelse(scounthours_study_leaddif1 <= .5, 0, NA)),
+           
+           any.start.type1 = max_(start.type1),
+ 
+           any.end.type1 = max_(end.type1))
+)
+
+start.varlist = c("id","sconthours_study","tac","firstpos","lastpos","start.type1.lead1",
+              "sconthours_study_lagdif1","scounthours_study_leaddif1","longlagdiff","longleaddiff")
+
+# View(skyn2[which(skyn2$start.type1 == 1 ), start.varlist])
+# 
+# View(skyn2[which(skyn2$id == 3176 & skyn2$sconthours_study >= 56.446), start.varlist])
+
+skyn2 = as.data.frame(
+  skyn2 %>%
+    mutate(firstbyepisode = ifelse((firstpos == 0 & start.type1.lead1 == 1  &
+                                        longleaddiff != 1) |
+                                     (firstpos == 1 & (start.type1 == 1) & 
+                                        longlagdiff == 1), 1, 0),
+           lastbyepisode = ifelse((lastpos == 0 & (end.type1.lag1 == 1) & 
+                                       longlagdiff != 1) |
+                                    (lastpos == 1 & (end.type1 == 1) & 
+                                       longleaddiff == 1), 1, 0))
+)
+
+freq(skyn2[,c("firstbyepisode","lastbyepisode")])
+with(skyn2, ctable(firstbyepisode, lastbyepisode))
+
+```
+
+
+```{r}
+
+# initial episodes are now tagged 
+
+## Cut these out of the data for now 
+
+# Drop non-episode observations 
+
+## first find them by counting firstbyepisode and lastbyepisode values
+
+skyn2 = as.data.frame(
+  skyn2 %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(firstbyepisode.count = collapse::fcumsum(firstbyepisode, na.rm = T, fill = T),
+           lastbyepisode.count = collapse::fcumsum(lastbyepisode, na.rm = T, fill = T))
+)
+
+# View(skyn2[,c("id","date","sconthours_study","tac","tac.pos",
+#                "firstbyepisode","lastbyepisode","firstbyepisode.count","lastbyepisode.count")])
+
+## the non-episode times will be those in which the cumulative firstbyepisode count is equal to the lastbyepisode count AND which are not the 
+### lastbyepisode observations themselves (in code: lastbyepisode == 0 & firstbyepisode.count == lastbyepisode.count)
+
+skyn2 = as.data.frame(
+  skyn2 %>%
+    mutate(non.episode.obs = 
+             ifelse(lastbyepisode == 0 & (firstbyepisode.count == lastbyepisode.count), 1, 0),
+           episode.obs = 
+             ifelse((firstbyepisode.count - lastbyepisode.count == 1) | lastbyepisode == 1, 1, 0))
+)
+
+with(skyn2, table(non.episode.obs, episode.obs))
+
+freq(skyn2[,c("episode.obs","non.episode.obs")])
+
+# View(skyn2[,c("id","date","sconthours_study","tac","tac.pos",
+#                "firstbyepisode","lastbyepisode","firstbyepisode.count","lastbyepisode.count","episode.obs")])
+
+```
+
+
+```{r}
+
+# Keep only the episode data 
+
+skyn2.episodes = filter(skyn2, episode.obs == 1)
+
+# View(skyn2.episodes[,c("id","date","sconthours_study","tac","tac.pos",
+#                "firstbyepisode","lastbyepisode","firstbyepisode.count","lastbyepisode.count","episode.obs")])
+
+# make new episode counts
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(episode.num = collapse::fcumsum(firstbyepisode, na.rm = T, fill = T))
+)
+
+# View(skyn2.episodes[,c("id","date","sconthours_study","tac","tac.pos",
+#                "firstbyepisode","lastbyepisode","firstbyepisode.count","lastbyepisode.count",
+#                "episode.obs","episode.num")])
+
+mean_(skyn2.episodes$episode.num - skyn2.episodes$firstbyepisode.count)
+
+# Look for long gaps in time within episodes 
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, episode.num) %>%
+    mutate(sconthours_study_dif1 = sconthours_study - lag(sconthours_study),
+           longdiff = ifelse(sconthours_study_dif1 >= .5, 1, 
+                             ifelse(sconthours_study_dif1 < .5, 0, NA)),
+           max.sconthours_study_dif1 = max_(sconthours_study_dif1),
+           obs.count = row_number())
+)
+
+varlist = c("id","episode.num","sconthours_study","firstbyepisode","lastbyepisode",
+            "sconthours_study_dif1","longdiff")
+
+# View(skyn2.episodes[which(skyn2.episodes$max.sconthours_study_dif1 >= 2), varlist])
+
+with(skyn2.episodes, table(obs.count == 2, longdiff))
+freq(skyn2.episodes$longdiff) #there were none in this test dataset
+
+with(skyn2.episodes, ctable(firstbyepisode,longdiff)) #there were none in this test dataset
+
+# combine longdiff and firstbyepisode 
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    mutate(episode.starter = ifelse(firstbyepisode == 1 | longdiff == 1, 1, 0))
+)
+
+with(skyn2.episodes, 
+     ctable(episode.starter, longdiff))
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(episode_ = collapse::fcumsum(episode.starter, na.rm = T, fill = T))
+)
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, episode_) %>%
+    mutate(episodefirst = ifelse(row_number() == 1, 1, 0),
+           episodelast = ifelse(row_number() == max(row_number()), 1, 0))
+)
+
+freq(skyn2.episodes[,c("episodefirst", "episodelast")])
+# 7 is now (still) the number of episodes
+
+# make new firstbyid, firstbywknd 
+dput(names(skyn2.episodes))
+skyn2.episodes = select(skyn2.episodes, -c(firstbyid, lastbyid))
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(firstbyid = ifelse(row_number() == 1, 1, 0),
+           lastbyid = ifelse(row_number() == max(row_number()), 1, 0)) 
+)
+
+```
+
+## Plot TAC episodes  
+
+If you have a lot of data, this will take a long time because it will plot all episodes
+
+```{r}
+
+head(skyn2.episodes[,c("id","episode_","sconthours","tac")])
+
+# Make sconthours_episode 
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, episode_) %>%
+    mutate(sconthours_episode = sconthours_study - min_(sconthours_study))
+)
+
+head(skyn2.episodes[,c("id","episode_","sconthours","sconthours_episode","tac")])
+
+skyn2.id1ep1 = filter(skyn2.episodes, 
+                      id == skyn2.episodes$id[1] & episode_ == skyn2.episodes$episode_[1])
+
+head(skyn2.id1ep1[,c("id","episode_","sconthours","sconthours_episode","tac")])
+
+ggplot(data = skyn2.id1ep1) +
+  geom_point(aes(y = tac, x = sconthours_episode), size = 1) +
+  geom_line(aes(y = tac, x = sconthours_episode), linewidth = 1) +
+  theme_classic() +
+  theme(axis.text = element_text(size = 11),
+        axis.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 11),
+        legend.title = element_text(size = 12, face = "bold")) +
+#  scale_x_continuous(breaks = seq(0, 24, by = 4)) +
+  labs(x = "Hour of Episode", y = "TAC")
+
+(tac.episode.plots =
+  ggplot(data = skyn2.episodes) +
+  geom_point(aes(y = tac, x = sconthours_episode), size = 1) +
+  geom_line(aes(y = tac, x = sconthours_episode), linewidth = 1) +
+  theme_classic() +
+  theme(axis.text = element_text(size = 11),
+        axis.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 11),
+        legend.title = element_text(size = 12, face = "bold")) +
+  labs(x = "Hour of Episode", y = "TAC") +
+  ggforce::facet_wrap_paginate(~factor(id):factor(episode_),
+                               ncol = 3, nrow = 2, page = 1, #you can edit the page you're looking at here (if you have more than 6 episodes)
+                               scales = "free"))
+
+(nc1 = ggforce::n_pages(tac.episode.plots))
+ 
+
+# head(sort(unique(skyn2.episodes$id)))
+
+# View(skyn2.episodes[which(skyn2.episodes$id == 3176 & skyn2.episodes$episode_ == 4),c("id","episode_","sconthours_study")])
+
+```
+ 
+## 2) Making features and Removing false positives 
+
+Originally based on these two articles: 
+
+Richards, V. L., Barnett, N. P., Cook, R. L., Leeman, R. F., Souza, T., Case, S., Prins, C., Cook, C., & Wang, Y. (2023). Correspondence between alcohol use measured by a wrist‐worn alcohol biosensor and self‐report via ecological momentary assessment (EMA) over a two‐week period. Alcoholism: Clinical and Experimental Research, 47(2), 308–318. https://doi.org/10.1111/acer.14995
+
+Courtney, J. B., Russell, M. A., & Conroy, D. E. (2023). Acceptability and validity of using the BACtrack Skyn wrist-worn transdermal alcohol concentration sensor to capture alcohol use across 28 days under naturalistic conditions – A pilot study. Alcohol, 108, 30–43. https://doi.org/10.1016/j.alcohol.2022.11.004
+
+```{r}
+
+describe(skyn2.episodes$tac)
+# Calculating initial characteristics of episodes 
+
+## PEAK is the maximum TAC value of the episode 
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, episode_) %>%
+    mutate(peak.tac = max_(tac))
+)
+
+## point-to-point rates
+
+### Calculate the differences 
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, episode_) %>%
+    mutate(tac.dif1 = tac - lag(tac),
+           tac.hours.dif1 = sconthours_study - lag(sconthours_study),
+           tac.rate = tac.dif1 / tac.hours.dif1,
+           tac.rises = ifelse(tac.rate > 0, tac.rate, NA),
+           tac.falls = ifelse(tac.rate < 0, tac.rate, NA),
+           tac.rise.times = ifelse(tac.rate > 0, tac.hours.dif1, NA),
+           tac.fall.times = ifelse(tac.rate < 0, tac.hours.dif1, NA))
+)
+
+# View(skyn2.episodes[,c("id","episode_","sconthours_study","tac","tac.rate","tac.rises","rise.rate.char")])
+
+# take the mean of ascending rates to get RISE RATE
+# take the mean of descending rates to get FALL RATE
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    group_by(id, episode_) %>%
+    mutate(rise.rate.tac = mean_(tac.rises),
+           fall.rate.tac = mean_(tac.falls))
+)
+
+Hmisc::describe(skyn2.episodes[which(skyn2.episodes$firstbyepisode == 1), "rise.rate.tac"])
+
+sum_(skyn2.episodes$episodefirst)
+
+# View(skyn2.episodes[,c("id","sconthours_study","episode_","tac","tac.dif1","tac.hours.dif1","tac.rate")])
+
+# Hmisc::describe(skyn2.episodes$tac.rate)
+sum_(skyn2.episodes$tac.rate == 0) 
+sum_(skyn2.episodes$tac.rate > 0) 
+sum_(skyn2.episodes$tac.rate < 0)
+sum_(!is.na(skyn2.episodes$tac.rate))
+sum_(is.na(skyn2.episodes$tac.rate))
+
+# with(skyn2.episodes, ctable(is.na(tac.rate), firstbyepisode))
+
+# DURATION is the sum of time differences for the episode
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, episode_) %>%
+    mutate(duration.tac = sum_(tac.hours.dif1),
+           rise.durs.tac = sum_(tac.rise.times),
+           fall.durs.tac = sum_(tac.fall.times))
+)
+
+with(skyn2.episodes, ctable(tac.pos, tac.pos.lag1))
+describeBy(skyn2.episodes$tac.rate == 0, group = skyn2.episodes[,c("tac.pos","tac.pos.lag1")])
+
+sums = as.data.frame(
+  skyn2.episodes %>%
+    group_by(tac.pos, tac.pos.lag1) %>%
+    summarise(n0rates = sum_(tac.rate == 0),
+              nrows = max(row_number()))
+)
+sums
+
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    rowwise() %>%
+    mutate(sum_rise_fall_durs = sum_(c(rise.durs.tac, fall.durs.tac))) %>%
+    ungroup() %>%
+    mutate(durs_diff = duration.tac - sum_rise_fall_durs)
+)
+describe(skyn2.episodes[,c("duration.tac","sum_rise_fall_durs",
+                           "rise.durs.tac", "fall.durs.tac","durs_diff")])
+
+# AUC 
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, episode_) %>%
+    mutate(tac.lag1 = lag(tac)) %>%
+    ungroup() %>%
+    rowwise() %>%
+    mutate(tac.sum1 = sum_(c(tac, tac.lag1))) %>%
+    ungroup() %>%
+    group_by(id, episode_) %>%
+    mutate(area = (tac.sum1/2)*(tac.hours.dif1),
+           auc.tac = sum_(area),
+           
+           area.rise = ifelse(tac.rate > 0, area, NA),
+           area.fall = ifelse(tac.rate < 0, area, NA),
+           
+           rise.auc.tac = sum_(area.rise),
+           fall.auc.tac = sum_(area.fall))
+)
+
+
+# take rise mean and fall mean 
+
+skyn2.episodes <- as.data.frame(
+  skyn2.episodes %>%
+    group_by(id, episode_) %>%
+    mutate(level.rise = ifelse(tac.rate > 0, tac, NA),
+           level.fall = ifelse(tac.rate < 0, tac, NA),
+           
+           rise.mean.tac = mean_(level.rise),
+           fall.mean.tac = mean_(level.fall),
+           
+           rise.median.tac = median_(level.rise),
+           fall.median.tac = median_(level.fall))
+)
+
+
+features = c("peak.tac", "rise.rate.tac","fall.rate.tac","duration.tac", "auc.tac")
+features2 = c("peak.tac", "rise.rate.tac","fall.rate.tac","duration.tac", "auc.tac",
+              "rise.durs.tac", "fall.durs.tac", "rise.auc.tac", "fall.auc.tac", "rise.mean.tac",
+              "fall.mean.tac", "rise.median.tac", "fall.median.tac")
+
+pwc = "pairwise.complete.obs"
+
+```
+
+Initial correlations between features
+
+```{r}
+
+describe(skyn2.episodes[which(skyn2.episodes$firstbyepisode == 1), features])
+cor(skyn2.episodes[which(skyn2.episodes$firstbyepisode == 1), features], use = pwc)
+
+describe(skyn2.episodes[which(skyn2.episodes$firstbyepisode == 1), features2])
+cor(skyn2.episodes[which(skyn2.episodes$firstbyepisode == 1), features2], use = pwc)
+names(skyn2.episodes)
+#hist(skyn2.episodes[which(skyn2.episodes$firstbyepisode == 1), features])
+#View(skyn2.episodes[which(skyn2.episodes$firstbyepisode == 1), features])
+
+```
+
+### Tagging and Removing Episodes that are likely false positives
+
+```{r}
+
+### Filter 1: Drop episodes less than 45 mins in duration (or are a single value)
+
+### Filter 2: Drop episodes <= 60 mins in duration and with a peak >= 400 (implausible)
+
+### Filter 3: Remove episodes with rise and fall rates that do not fall between 20 and 300
+
+skyn2.episodes = as.data.frame(
+  skyn2.episodes %>%
+    mutate(drop1 = ifelse(duration.tac <= 0.75, 1, 
+                          ifelse(duration.tac > 0.75, 0, NA)),
+           drop2 = ifelse(duration.tac <= 1 & peak.tac >= 400, 1, 
+                          ifelse(duration.tac > 1 | peak.tac < 400, 0, NA)),
+           drop3 = ifelse(rise.rate.tac > 300, 1, # rise.rate.tac < 10 |
+                          ifelse(rise.rate.tac <= 300, 0, NA)),  # rise.rate.tac >= 10 & 
+           drop4 = ifelse(fall.rate.tac < -300, 1, # fall.rate.tac > -10 | 
+                          ifelse(fall.rate.tac >= -300, 0, NA))) %>%
+    group_by(id, episode_) %>%
+    mutate(drop5 = ifelse(max_(row_number()) == 1, 1,
+                          ifelse(max_(row_number()) > 1, 0))) %>% # more than one observation
+    ungroup() %>%
+    rowwise() %>%
+    mutate(dropsum = sum_(c(drop1,drop2,drop3,drop4, drop5)))
+)
+
+# Frequencies 
+drops = c("drop1","drop2","drop3","drop4","drop5")
+sapply(skyn2.episodes[which(skyn2.episodes$episodefirst == 1), drops], sum_)
+freq(skyn2.episodes[which(skyn2.episodes$episodefirst == 1), "dropsum"]) #no episodes were dropped from this test data set (that is not usually the case)
+
+```
+
+Separate the keeps and drops 
+
+```{r}
+
+skyn2.keep = filter(skyn2.episodes, dropsum == 0)
+skyn2.drop = filter(skyn2.episodes, dropsum > 0)
+
+# Keeping
+sum(!is.na(skyn2.keep$id)) # observations = 5064
+sum(skyn2.keep$episodefirst) # episodes = 7
+# View(unique(skyn2.keep[,c("id","episode_")]))
+
+# View(skyn2.keep[which(skyn2.keep$id == 3176 &
+#                         skyn2.keep$episode_ == 4), c("id","episode_","tac")])
+
+# Dropping
+sum(!is.na(skyn2.drop$id)) # observations = 0
+sum(skyn2.drop$episodefirst) # episodes = 0
+
+# as percentages 
+round((sum(!is.na(skyn2.drop$id)) / (sum(!is.na(skyn2.drop$id)) + sum(!is.na(skyn2.keep$id))))*100, 2) # observations
+round((sum(skyn2.drop$episodefirst) / (sum(skyn2.drop$episodefirst) + sum(skyn2.keep$episodefirst)))*100, 2) # episodes
+
+```
+
+Take an initial look at episodes we are keeping
+
+```{r}
+
+round(cor(skyn2.keep[which(skyn2.keep$episodefirst == 1),features], use = pwc), 2)
+describe(skyn2.keep[which(skyn2.keep$episodefirst == 1), features])
+
+round(cor(skyn2.keep[which(skyn2.keep$episodefirst == 1),features2], use = pwc), 2)
+describe(skyn2.keep[which(skyn2.keep$episodefirst == 1), features2])
+
+# hist(skyn2.keep[which(skyn2.keep$episodefirst == 1),
+#                 c("peak.tac", "rise.rate.tac", "fall.rate.tac",
+#                   "duration.tac", "auc.tac")])
+
+sum(skyn2.keep$episodefirst)
+sum(skyn2.keep$episodelast)
+with(skyn2.keep, ctable(episodefirst, episodelast))
+
+```
+
+PLOT KEEPER EPISODES 
+
+```{r}
+
+tac.keeps.features = as.data.frame(
+    skyn2.keep %>%
+      group_by(id, episode_) %>%
+      summarise(peak = paste("Peak=", round(unique(peak.tac), 1)),
+                rise = paste("Rise=", round(unique(rise.rate.tac), 1)),
+                fall = paste("Fall=", round(unique(fall.rate.tac), 1)),
+                duration = paste("Durs=", round(unique(duration.tac), 1)),
+                ptac1 = seq(min_(tac), max_(tac), length.out = 6)[5],
+                ptac2 = seq(min_(tac), max_(tac), length.out = 6)[4],
+                ptac3 = seq(min_(tac), max_(tac), length.out = 6)[3],
+                ptac4 = seq(min_(tac), max_(tac), length.out = 6)[2],
+                m.time = mean_(unique(sconthours_episode)))
+)
+
+(tac.keep.episode.plots =
+  ggplot(data = skyn2.keep) +
+  geom_point(aes(y = tac, x = sconthours_episode), size = 1) +
+  geom_line(aes(y = tac, x = sconthours_episode), linewidth = 1) +
+  geom_text(data = tac.keeps.features, aes(x = m.time, y = ptac1, label = peak)) +
+  geom_text(data = tac.keeps.features, aes(x = m.time, y = ptac2, label = rise)) +
+  geom_text(data = tac.keeps.features, aes(x = m.time, y = ptac3, label = fall)) +
+  geom_text(data = tac.keeps.features, aes(x = m.time, y = ptac4, label = duration)) +
+  theme_classic() +
+  theme(axis.text = element_text(size = 11),
+        axis.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 11),
+        legend.title = element_text(size = 12, face = "bold")) +
+  labs(x = "Hour of Episode", y = "TAC") +
+  ggforce::facet_wrap_paginate(~factor(id):factor(episode_),
+                               ncol = 3, nrow = 2, page = 1,
+                               scales = "free"))
+
+(plots.pages1 = ggforce::n_pages(tac.keep.episode.plots))
+
+pdf("tac.episode.plots.keep_2025_11_06_R.pdf")
+for(i in 1:plots.pages1){
+  print(tac.keep.episode.plots +
+          ggforce::facet_wrap_paginate(~factor(id):factor(episode_),
+                                       ncol = 3, nrow = 2, page = i, scales = "free"))
+}
+dev.off()
+
+# PLOT DROPPED EPISODES
+
+
+tac.drops.features = as.data.frame(
+    skyn2.drop %>%
+      group_by(id, episode_) %>%
+      summarise(peak = paste("Peak=", round(unique(peak.tac), 1)),
+                rise = paste("Rise=", round(unique(rise.rate.tac), 1)),
+                fall = paste("Fall=", round(unique(fall.rate.tac), 1)),
+                duration = paste("Durs=", round(unique(duration.tac), 1)),
+                ptac1 = seq(min_(tac), max_(tac), length.out = 6)[5],
+                ptac2 = seq(min_(tac), max_(tac), length.out = 6)[4],
+                ptac3 = seq(min_(tac), max_(tac), length.out = 6)[3],
+                ptac4 = seq(min_(tac), max_(tac), length.out = 6)[2],
+                m.time = mean_(unique(sconthours_episode)))
+)
+
+# View(tac.drops.features)
+
+(tac.drop.episode.plots =
+  ggplot(data = skyn2.drop) +
+  geom_point(aes(y = tac, x = sconthours_episode), size = 1) +
+  geom_line(aes(y = tac, x = sconthours_episode), linewidth = 1) +
+  geom_text(data = tac.drops.features, aes(x = m.time, y = ptac1, label = peak)) +
+  geom_text(data = tac.drops.features, aes(x = m.time, y = ptac2, label = rise)) +
+  geom_text(data = tac.drops.features, aes(x = m.time, y = ptac3, label = fall)) +
+  geom_text(data = tac.drops.features, aes(x = m.time, y = ptac4, label = duration)) +
+  theme_classic() +
+  theme(axis.text = element_text(size = 11),
+        axis.title = element_text(size = 12, face = "bold"),
+        legend.text = element_text(size = 11),
+        legend.title = element_text(size = 12, face = "bold")) +
+  labs(x = "Hour of Episode", y = "TAC") +
+  ggforce::facet_wrap_paginate(~factor(id):factor(episode_),
+                               ncol = 3, nrow = 2, page = 1,
+                               scales = "free"))
+
+# (plots.pages2 = ggforce::n_pages(tac.drop.episode.plots))
+# 
+# pdf("tac.episode.plots.drop_2023_06_23_R.pdf")
+# for(i in 1:plots.pages2){
+#   print(tac.drop.episode.plots +
+#           ggforce::facet_wrap_paginate(~factor(id):factor(episode_),
+#                                        ncol = 3, nrow = 2, page = i, scales = "free"))
+# }
+# dev.off()
+
+```
+
+# Make new episode counter in the episodes we are keeping 
+
+```{r}
+
+names(skyn2.keep)
+# Rename features so we know they're by episode 
+skyn2.keep = as.data.frame(
+  skyn2.keep %>%
+    rename(peak.tac.epi = peak.tac,
+           rise.rate.tac.epi = rise.rate.tac,
+           fall.rate.tac.epi = fall.rate.tac,
+           duration.tac.epi = duration.tac,
+           auc.tac.epi = auc.tac,
+           rise.durs.tac.epi = rise.durs.tac,
+           fall.durs.tac.epi = fall.durs.tac,
+           rise.auc.tac.epi = rise.auc.tac,
+           fall.auc.tac.epi = fall.auc.tac,
+           rise.mean.tac.epi = rise.mean.tac,
+           fall.mean.tac.epi = fall.mean.tac,
+           rise.median.tac.epi = rise.median.tac,
+           fall.median.tac.epi = fall.median.tac)
+)
+
+# now make features by the social day. 
+
+## Peak 
+
+skyn2.keep = as.data.frame(
+  skyn2.keep %>%
+    group_by(id, sdaten) %>%
+    mutate(peak.tac.day = max_(tac))
+)
+
+# rise and fall rates
+skyn2.keep = as.data.frame(
+  skyn2.keep %>%
+    group_by(id, sdaten) %>%
+    mutate(rise.rate.tac.day = mean_(tac.rises),
+           fall.rate.tac.day = mean_(tac.falls))
+)
+
+skyn2.keep = as.data.frame(
+  skyn2.keep %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, sdaten) %>%
+    mutate(duration.tac.day = sum_(tac.hours.dif1),
+           rise.durs.tac.day = sum_(tac.rise.times),
+           fall.durs.tac.day = sum_(tac.fall.times))
+)
+
+skyn2.keep = as.data.frame(
+  skyn2.keep %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, sdaten) %>%
+    mutate(auc.tac.day = sum_(area),
+           rise.auc.tac.day = sum_(area.rise),
+           fall.auc.tac.day = sum_(area.fall))
+)
+
+
+skyn2.keep = as.data.frame(
+  skyn2.keep %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, sdaten) %>%
+    mutate(rise.mean.tac.day = mean_(level.rise),
+           fall.mean.tac.day = mean_(level.fall),
+           
+           rise.median.tac.day = median_(level.rise),
+           fall.median.tac.day = median_(level.fall))
+)
+
+```
+
+
+```{r}
+
+names(skyn2.keep)
+freq(skyn2.keep$episodelast)
+
+skyn2.keep.shell = select(skyn2.keep, id, sconthours_study, episodefirst,
+                          peak.tac.epi, rise.rate.tac.epi, fall.rate.tac.epi,
+                          duration.tac.epi, auc.tac.epi, rise.durs.tac.epi, fall.durs.tac.epi,
+                          rise.auc.tac.epi, fall.auc.tac.epi, rise.mean.tac.epi, fall.mean.tac.epi,
+                          rise.median.tac.epi, fall.median.tac.epi)
+
+skyn2.keep.shell = as.data.frame(
+  skyn2.keep.shell %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(episode = collapse::fcumsum(episodefirst, na.rm = T, fill = T), 
+           episode.obs = 1) %>%
+    select(-episodefirst) %>%
+    ungroup() %>%
+    group_by(id, episode) %>%
+    mutate(firstbyepisode = ifelse(row_number() == 1, 1, 0),
+           lastbyepisode = ifelse(row_number() == max(row_number()), 1, 0))
+)
+
+skyn2.keep = as.data.frame(
+  skyn2.keep %>%
+  arrange(id, sconthours_study) %>%
+  group_by(id, sdaten) %>%
+  mutate(firstbysdaten = ifelse(row_number() == 1, 1, 0),
+         lastbysdaten = ifelse(row_number() == max(row_number()), 1, 0))
+)
+ 
+skyn2.keep.days = as.data.frame(
+  skyn2.keep %>%
+    filter(firstbysdaten == 1) %>%
+    select(id, sdaten, peak.tac.day, rise.rate.tac.day, fall.rate.tac.day, 
+           duration.tac.day, auc.tac.day,rise.durs.tac.day, fall.durs.tac.day,
+                          rise.auc.tac.day, fall.auc.tac.day, rise.mean.tac.day, fall.mean.tac.day,
+                          rise.median.tac.day, fall.median.tac.day)
+)
+
+skyn2.drop.shell = select(skyn2.drop, id, sconthours_study)
+
+skyn2.drop.shell = as.data.frame(
+  skyn2.drop.shell %>%
+    mutate(drop.episode.obs = 1)
+)
+
+names(skyn2)
+hist(skyn2$tac)
+
+skyn2.shell = select(skyn2, id, sconthours_study, tac..ug.L., tac..ug.L.smooth, tac, firstpos, lastpos)
+
+skyn1.shell = select(skyn1, id, device.id, firmware.version, app.version, 
+                     device.timestamp, device.time.zone, temperature..C., motion..g., date, worn, 
+                     time, daten, timen, hours, minutes, seconds, dayofweek, 
+                     sdaten, shours, sconthours,
+                     sdatencountc1, sconthours_study, 
+                     dayofweek_sdaten)
+
+skyn3_ = merge(
+         merge(
+          merge(skyn1.shell, skyn2.shell, by = c("id", "sconthours_study"), all = T),
+           skyn2.keep.shell, by = c("id","sconthours_study"), all = T),
+            skyn2.drop.shell, by = c("id", "sconthours_study"), all = T)
+  
+nrow(skyn3_)
+nrow(skyn1.shell)
+nrow(skyn3_) - nrow(skyn1.shell) == 0
+
+skyn3 = merge(skyn3_, skyn2.keep.days, by = c("id", "sdaten"), all = T)
+
+nrow(skyn3); nrow(skyn3_)
+nrow(skyn3) - nrow(skyn3_)
+
+# make firsts and lasts 
+names(skyn3)
+head(skyn3)
+
+skyn3 = as.data.frame(
+  skyn3 %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(firstbyid = ifelse(row_number() == 1, 1, 0),
+           lastbyid = ifelse(row_number() == max(row_number()), 1, 0)) %>%
+       ungroup() %>%
+    group_by(id, daten) %>%
+    mutate(firstbyday = ifelse(row_number() == 1, 1, 0),
+           lastbyday = ifelse(row_number() == max(row_number()), 1, 0)) %>%
+    ungroup()  %>% 
+    group_by(id, sdaten) %>%
+    mutate(firstbysday = ifelse(row_number() == 1, 1, 0),
+           lastbysday = ifelse(row_number() == max(row_number()), 1, 0))
+)
+
+dput(names(skyn3))
+
+# View(skyn3[which(is.na(skyn3$episode)), c("id","sdaten","episode","sconthours_study", 
+#                                     "firstbyepisode","lastbyepisode")])
+
+```
+
+```{r}
+
+# calculate % worn for each day 
+
+# Coding using number of worn observations 
+
+skyn3 <- as.data.frame(
+  skyn3 %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id) %>%
+    mutate(total_tacs.id = sum(worn),
+           obsnum.id = row_number()) %>%
+        ungroup() %>%
+    group_by(id, daten) %>% 
+    mutate(total_tacs.day = sum(worn),
+           obsnum.day = row_number()) %>%
+    ungroup() %>%
+    group_by(id, sdaten) %>%
+    mutate(total_tacs.sday = sum(worn),
+           obsnum.sday = row_number())
+)
+
+# numbers of expected worn TAC data points (depends on study design, but based on the number of observations from 24 hours of wear)
+
+etacs <- 4320
+
+## Calculate Compliance by the Calendar Day or Social Day
+skyn3 = as.data.frame(
+  skyn3 %>%
+    mutate(compliance.day = total_tacs.day / etacs,
+            compliance.sday = total_tacs.sday / etacs,                        
+                compliance.day.id = total_tacs.id / (etacs*4), #the multiplied number should be changed based on how many study days
+                     compliance.sday.id = total_tacs.id / (etacs*4) #the multiplied number should be changed based on how many study days
+))
+
+names(skyn3)
+    
+
+# check over these
+skyn3.persons = filter(skyn3, firstbyid == 1)
+skyn3.day = filter(skyn3, firstbyday == 1)
+skyn3.sday = filter(skyn3, firstbysday == 1)
+
+describe(skyn3.persons[,c("compliance.day.id","compliance.sday.id")])
+describe(skyn3.day[which(skyn3.day$dayofweek %in% c("Thursday","Friday","Saturday")),"compliance.day"]) #Th-Sa = social weekend
+describe(skyn3.sday[which(skyn3.sday$dayofweek_sdaten %in% c("Thursday","Friday","Saturday")),"compliance.sday"])
+
+
+with(skyn3.sday, describeBy(compliance.sday, dayofweek_sdaten))
+
+```
+
+```{r}
+
+# Control outliers in features 
+
+Hmisc::describe(skyn3.sday[,c("peak.tac.day","rise.rate.tac.day","fall.rate.tac.day","duration.tac.day","auc.tac.day")])
+
+skyn3$fall.rate.tac.day.rev_ = with(skyn3, (-1)*fall.rate.tac.day)
+
+skyn3 = as.data.frame(
+  skyn3 %>%
+    rename(peak.tac.day_ = peak.tac.day,
+           rise.rate.tac.day_ = rise.rate.tac.day,
+           fall.rate.tac.day_ = fall.rate.tac.day,
+           duration.tac.day_ = duration.tac.day,
+           auc.tac.day_ = auc.tac.day,
+           rise.durs.tac.day_ = rise.durs.tac.day, 
+           fall.durs.tac.day_ = fall.durs.tac.day,
+           rise.auc.tac.day_ = rise.auc.tac.day, 
+           fall.auc.tac.day_ = fall.auc.tac.day,
+           rise.mean.tac.day_ = rise.mean.tac.day,
+           fall.mean.tac.day_ = fall.mean.tac.day,
+           rise.median.tac.day_ = rise.median.tac.day,
+           fall.median.tac.day_ = fall.median.tac.day)
+)
+
+(quants = describe(skyn3[which(skyn3$firstbysday == 1),
+               c("peak.tac.day_","rise.rate.tac.day_","fall.rate.tac.day.rev_",
+                 "duration.tac.day_","auc.tac.day_","rise.durs.tac.day_",
+                 "fall.durs.tac.day_","rise.auc.tac.day_","fall.auc.tac.day_",
+                 "rise.mean.tac.day_","fall.mean.tac.day_","rise.median.tac.day_","fall.median.tac.day_")],
+         quant = c(0.25, 0.5, 0.75, 0.99)))
+
+quants$Q0.99
+quants$Q0.99[1]
+
+# Winsorize at the 99th percentile 
+
+skyn3 = as.data.frame(
+  skyn3 %>%
+    mutate(peak.tac.day = ifelse(peak.tac.day_ < quants$Q0.99[1], peak.tac.day_,
+                                 ifelse(peak.tac.day_ >= quants$Q0.99[1], quants$Q0.99[1], NA)),
+           rise.rate.tac.day = ifelse(rise.rate.tac.day_ < quants$Q0.99[2], rise.rate.tac.day_,
+                                 ifelse(rise.rate.tac.day_ >= quants$Q0.99[2], quants$Q0.99[2], NA)),
+           fall.rate.tac.day.rev = ifelse(fall.rate.tac.day.rev_ < quants$Q0.99[3], fall.rate.tac.day.rev_,
+                                          ifelse(fall.rate.tac.day.rev_ >= quants$Q0.99[3], quants$Q0.99[3], NA)),
+           duration.tac.day = ifelse(duration.tac.day_ < quants$Q0.99[4], duration.tac.day_,
+                                          ifelse(duration.tac.day_ >= quants$Q0.99[4], quants$Q0.99[4], NA)),
+           auc.tac.day = ifelse(auc.tac.day_ < quants$Q0.99[5], auc.tac.day_,
+                                          ifelse(auc.tac.day_ >= quants$Q0.99[5], quants$Q0.99[5], NA)),
+           
+           rise.durs.tac.day = ifelse(rise.durs.tac.day_ < quants$Q0.99[6], rise.durs.tac.day_,
+                                      ifelse(rise.durs.tac.day_ > quants$Q0.99[6], quants$Q0.99[6], NA)),
+           fall.durs.tac.day = ifelse(fall.durs.tac.day_ < quants$Q0.99[7], fall.durs.tac.day_,
+                                      ifelse(fall.durs.tac.day_ > quants$Q0.99[7], quants$Q0.99[7], NA)),
+           rise.auc.tac.day = ifelse(rise.auc.tac.day_ < quants$Q0.99[8], rise.auc.tac.day_,
+                                      ifelse(rise.auc.tac.day_ > quants$Q0.99[8], quants$Q0.99[8], NA)),
+           fall.auc.tac.day = ifelse(fall.auc.tac.day_ < quants$Q0.99[9], fall.auc.tac.day_,
+                                      ifelse(fall.auc.tac.day_ > quants$Q0.99[9], quants$Q0.99[9], NA)),
+           rise.mean.tac.day = ifelse(rise.mean.tac.day_ < quants$Q0.99[10], rise.mean.tac.day_,
+                                      ifelse(rise.mean.tac.day_ > quants$Q0.99[10], quants$Q0.99[10], NA)),
+           fall.mean.tac.day = ifelse(fall.mean.tac.day_ < quants$Q0.99[11], fall.mean.tac.day_,
+                                      ifelse(fall.mean.tac.day_ > quants$Q0.99[11], quants$Q0.99[11], NA)),
+           rise.median.tac.day = ifelse(rise.median.tac.day_ < quants$Q0.99[12], rise.median.tac.day_,
+                                      ifelse(rise.median.tac.day_ > quants$Q0.99[12], quants$Q0.99[12], NA)),
+           fall.median.tac.day = ifelse(fall.median.tac.day_ < quants$Q0.99[13], fall.median.tac.day_,
+                                      ifelse(fall.median.tac.day_ > quants$Q0.99[13], quants$Q0.99[13], NA)))
+)
+
+describe(skyn3[which(skyn3$firstbysday == 1),
+               c("peak.tac.day_","peak.tac.day","rise.rate.tac.day_","rise.rate.tac.day",
+                 "fall.rate.tac.day.rev_","fall.rate.tac.day.rev",
+                 "duration.tac.day_","duration.tac.day","auc.tac.day_","auc.tac.day",
+                 "rise.durs.tac.day_","rise.durs.tac.day",
+                 "fall.durs.tac.day_","fall.durs.tac.day",
+                 "rise.auc.tac.day_","rise.auc.tac.day",
+                 "fall.auc.tac.day_","fall.auc.tac.day",
+                 "rise.mean.tac.day_","rise.mean.tac.day",
+                 "fall.mean.tac.day_","fall.mean.tac.day",
+                 "rise.median.tac.day_","rise.median.tac.day",
+                 "fall.median.tac.day_","fall.median.tac.day")],
+         quant = c(0.25, 0.5, 0.75, 0.99))
+
+skyn3$fall.rate.tac.day = with(skyn3, (-1)*fall.rate.tac.day.rev)
+
+```
+
+
+```{r}
+
+# CHECK SOCIAL DAILY COMPLIANCE DISTRIBUTION
+
+hist(skyn3.sday$compliance.sday)
+mean_(skyn3.sday$compliance.sday) 
+
+Hmisc::describe(skyn3.sday$compliance.sday)
+
+freq(round(skyn3.sday$compliance.sday, 2))
+
+freq(skyn3.sday$compliance.sday > .95)
+
+table(skyn3.sday[which(is.na(skyn3.sday$peak.tac.day)), "compliance.sday"] > .95)
+table(skyn3.sday[which(is.na(skyn3.sday$peak.tac.day)), "compliance.sday"] > .9)
+table(skyn3.sday[which(is.na(skyn3.sday$peak.tac.day)), "compliance.sday"] > .8)
+
+hist(skyn3.sday[which(is.na(skyn3.sday$peak.tac.day)), "compliance.sday"])
+Hmisc::describe(skyn3.sday[which(is.na(skyn3.sday$peak.tac.day)), "compliance.sday"])
+
+compliance.check = skyn3.sday[which(is.na(skyn3.sday$peak.tac.day)), "compliance.sday"]
+
+compliance.data = cbind.data.frame(
+  compliance = seq(.1, .9, .1),
+  percentage = c(freq(compliance.check > .1)[6],
+                 freq(compliance.check > .2)[6],
+                 freq(compliance.check > .3)[6],
+                 freq(compliance.check > .4)[6],
+                 freq(compliance.check > .5)[6],
+                 freq(compliance.check > .6)[6],
+                 freq(compliance.check > .7)[6],
+                 freq(compliance.check > .8)[6],
+                 freq(compliance.check > .9)[6]) 
+)
+
+(compliance.plot = 
+  ggplot(data = compliance.data, aes(x = compliance, y = percentage)) +
+  geom_point() + geom_line() +
+    scale_x_continuous(breaks = seq(.1, .9, .1), limits = c(.09,.91)) +
+    scale_y_continuous(breaks = seq(50, 100, 10), limits = c(49, 101)) +
+    labs(x = "Compliance Level", y = "Percent of Days Satisfying Compliance Level"))
+
+# If 80% of expected data are present, but features are missing, we will assume that no drinking occurred. 
+
+c("peak.tac.day_","rise.rate.tac.day_","fall.rate.tac.day.rev_","duration.tac.day_","auc.tac.day_")
+
+skyn3 = as.data.frame(
+  skyn3 %>% 
+    mutate(peak.tac.day.0 = ifelse(is.na(peak.tac.day) & compliance.sday >= .8, 0,
+                                   ifelse(is.na(peak.tac.day) & compliance.sday < .8, NA,
+                                          ifelse(!is.na(peak.tac.day), peak.tac.day, NA))),
+           
+           rise.rate.tac.day.0 = ifelse(is.na(rise.rate.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(rise.rate.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(rise.rate.tac.day), rise.rate.tac.day, NA))),
+           
+           fall.rate.tac.day.rev.0 = ifelse(is.na(fall.rate.tac.day.rev) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(fall.rate.tac.day.rev) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(fall.rate.tac.day.rev), fall.rate.tac.day.rev, NA))),
+           
+           fall.rate.tac.day.0 = ifelse(is.na(fall.rate.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(fall.rate.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(fall.rate.tac.day), fall.rate.tac.day, NA))),
+           
+           duration.tac.day.0 = ifelse(is.na(duration.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(duration.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(duration.tac.day), duration.tac.day, NA))),
+           
+           auc.tac.day.0 = ifelse(is.na(auc.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(auc.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(auc.tac.day), auc.tac.day, NA))),
+           
+           rise.durs.tac.day.0 = ifelse(is.na(rise.durs.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(rise.durs.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(rise.durs.tac.day), rise.durs.tac.day, NA))),
+           
+           fall.durs.tac.day.0 = ifelse(is.na(fall.durs.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(fall.durs.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(fall.durs.tac.day), fall.durs.tac.day, NA))),
+           
+           rise.auc.tac.day.0 = ifelse(is.na(rise.auc.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(rise.auc.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(rise.auc.tac.day), rise.auc.tac.day, NA))),
+           
+           fall.auc.tac.day.0 = ifelse(is.na(fall.auc.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(fall.auc.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(fall.auc.tac.day), fall.auc.tac.day, NA))),
+           
+           rise.mean.tac.day.0 = ifelse(is.na(rise.mean.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(rise.mean.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(rise.mean.tac.day), rise.mean.tac.day, NA))),
+           
+           fall.mean.tac.day.0 = ifelse(is.na(fall.mean.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(fall.mean.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(fall.mean.tac.day), fall.mean.tac.day, NA))),
+           
+           rise.median.tac.day.0 = ifelse(is.na(rise.median.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(rise.median.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(rise.median.tac.day), rise.median.tac.day, NA))),
+           
+           fall.median.tac.day.0 = ifelse(is.na(fall.median.tac.day) & compliance.sday >= .8, 0,
+                                        ifelse(is.na(fall.median.tac.day) & compliance.sday < .8, NA,
+                                               ifelse(!is.na(fall.median.tac.day), fall.median.tac.day, NA))))
+)
+
+describe(skyn3[which(skyn3$firstbysday == 1),
+               c("peak.tac.day","rise.rate.tac.day","fall.rate.tac.day.rev","fall.rate.tac.day","duration.tac.day","auc.tac.day",
+                 "rise.durs.tac.day","fall.durs.tac.day","rise.auc.tac.day","fall.auc.tac.day","rise.mean.tac.day",
+                 "fall.mean.tac.day","rise.median.tac.day","fall.median.tac.day")])
+describe(skyn3[which(skyn3$firstbysday == 1),
+               c("peak.tac.day.0","rise.rate.tac.day.0","fall.rate.tac.day.rev.0","fall.rate.tac.day.0","duration.tac.day.0","auc.tac.day.0",
+                 "rise.durs.tac.day.0","fall.durs.tac.day.0","rise.auc.tac.day.0","fall.auc.tac.day.0",
+                 "rise.mean.tac.day.0","fall.mean.tac.day.0","rise.median.tac.day.0","fall.median.tac.day.0")])
+
+
+features.0 = c("peak.tac.day.0","rise.rate.tac.day.0","fall.rate.tac.day.rev.0","duration.tac.day.0",
+               "auc.tac.day.0","rise.durs.tac.day.0","fall.durs.tac.day.0",
+               "rise.auc.tac.day.0","fall.auc.tac.day.0",
+               "rise.mean.tac.day.0","fall.mean.tac.day.0","rise.median.tac.day.0","fall.median.tac.day.0")
+
+cor(skyn3[which(skyn3$firstbysday == 1),features.0], use = "pairwise.complete.obs")
+
+```
+
+# save the daily features dataset 
+
+```{r}
+
+# Add the start and end times of episodes to this data 
+
+skyn3.episodes = as.data.frame(
+  skyn3 %>%
+    filter(!is.na(episode)) %>%
+    group_by(id, episode) %>%
+    summarise(min_sconthours_study_episode = min_(sconthours_study),
+              max_sconthours_study_episode = max_(sconthours_study)) 
+)
+
+skyn3 = merge(skyn3, skyn3.episodes, by = c("id","episode"), all = T)
+
+skyn3 = as.data.frame(
+  skyn3 %>%
+    arrange(id, sconthours_study) %>%
+    mutate(episode.sconthours_study = ifelse(is.na(episode), NA,
+                                                     ifelse(!is.na(episode), sconthours_study, NA)),
+           episode.daten = ifelse(is.na(episode), NA,
+                                  ifelse(!is.na(episode), daten, NA)),
+           episode.sdaten = ifelse(is.na(episode), NA,
+                                   ifelse(!is.na(episode), sdaten, NA)),
+           episode.dayofweek = ifelse(is.na(episode), NA,
+                                      ifelse(!is.na(episode), dayofweek, NA)),
+           episode.dayofweek_sdaten = ifelse(is.na(episode), NA,
+                                             ifelse(!is.na(episode), dayofweek_sdaten, NA)),
+           episode.sconthours = ifelse(is.na(episode), NA,
+                                       ifelse(!is.na(episode), sconthours, NA))) %>%
+    group_by(id, sdaten) %>%
+    mutate(min.episode.sconthours_study.sday = min_(episode.sconthours_study),
+           max.episode.sconthours_study.sday = max_(episode.sconthours_study),
+           
+           min.episode.sconthours.sday = min_(episode.sconthours),
+           max.episode.sconthours.sday = max_(episode.sconthours))
+)
+names(skyn3)
+# View(skyn3[,c("id","sdaten","episode","sconthours_study","episode.sconthours_study",
+#              "min_sconthours_study_episode","max_sconthours_study_episode",
+#              "min.episode.sconthours_study.sday","max.episode.sconthours_study.sday")])
+
+# count the number of episodes per day, the number of starts, and the number of ends 
+
+skyn3 = as.data.frame(
+  skyn3 %>%
+    arrange(id, sconthours_study) %>%
+    group_by(id, sdaten) %>%
+    mutate(n.episodes.sday = length(unique(na.omit(episode))),
+           n.episode.starts.sday = sum_(firstbyepisode),
+           n.episode.ends.sday = sum_(lastbyepisode),
+           n.episode.obs.sday = sum(!is.na(episode))) %>%
+    ungroup() %>%
+    group_by(id, daten) %>%
+    mutate(n.episodes.day = length(unique(na.omit(episode))),
+           n.episode.starts.day = sum_(firstbyepisode),
+           n.episode.ends.day = sum_(lastbyepisode),
+           n.episode.obs.day = sum(!is.na(episode))) %>%
+    ungroup() %>%
+    group_by(id) %>%
+    mutate(n.episodes.person = length(unique(na.omit(episode))),
+           n.episode.starts.person = sum_(firstbyepisode),
+           n.episode.ends.person = sum_(lastbyepisode),
+           n.episode.obs.person = sum(!is.na(episode)))
+)
+
+# Filter out any variables you don't want or need 
+# This is the dataset we will use for analysis. 
+
+```
+
+
+```{r}
+
+# save
+dput(names(skyn3))
+skyn.days = as.data.frame(
+  skyn3 %>%
+    filter(firstbysday == 1) %>%
+    select(id, sdaten, device.id, firmware.version, app.version, date,
+           sdatencountc1,
+           dayofweek_sdaten, compliance.sday, 
+           compliance.sday.id, peak.tac.day, rise.rate.tac.day, fall.rate.tac.day.rev, 
+           duration.tac.day, auc.tac.day, fall.rate.tac.day, rise.durs.tac.day, fall.durs.tac.day,
+           rise.auc.tac.day, fall.auc.tac.day, rise.mean.tac.day, fall.mean.tac.day,
+           rise.median.tac.day, fall.median.tac.day,
+           peak.tac.day.0, rise.rate.tac.day.0, fall.rate.tac.day.rev.0, fall.rate.tac.day.0,
+           duration.tac.day.0, auc.tac.day.0, rise.durs.tac.day.0, fall.durs.tac.day.0,
+           rise.auc.tac.day.0, fall.auc.tac.day.0, rise.mean.tac.day.0, fall.mean.tac.day.0,
+           rise.median.tac.day.0, fall.median.tac.day.0, min.episode.sconthours_study.sday,
+           max.episode.sconthours_study.sday, min.episode.sconthours.sday,
+           max.episode.sconthours.sday, n.episodes.sday, n.episode.starts.sday, 
+           n.episode.ends.sday, n.episode.obs.sday, n.episode.starts.person, 
+           n.episode.ends.person, n.episode.obs.person)
+)
+
+# NAs were introduced for each person (once each) for date (remove!)
+sum(is.na(skyn.days$sdaten))
+skyn.days <- skyn.days[!is.na(skyn.days$sdaten),]
+
+write.csv(skyn.days, "Skyn_features_days_TACLion_testdata_2025_11_06.csv", row.names = F)
+
+```
+
+
+```{r}
+
+# names(skyn3)
+# 
+# freq(skyn3$episode.obs)
+# freq(!is.na(skyn3$episode))
+# 
+#  write.csv(skyn3, "skyn_all_data_TAClion_testdata_2025_11_06.csv", row.names = F)
+# 
+# skyn3pos = skyn3[which(!is.na(skyn3$episode)),]
+# 
+#  write.csv(skyn3pos, "skyn_positive_data_TAClion_testdata_2025_11_06.csv", row.names = F)
+
+```
